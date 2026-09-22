@@ -63,25 +63,31 @@ Configure the following in the scanner repository (**Settings > Secrets and vari
 
 ---
 
+---
+
 ## Running Scans
 
-### Live Local Scan across Your Repositories
-Run the real CodeMender scanner locally against your repositories:
+### Asynchronous Parallel Local Runner
+Run the real CodeMender scanner locally across your repositories in parallel:
 
 ```bash
-# Set your GitHub PAT for repository cloning
-export GITHUB_TOKEN="<your-pat>"
-
-# Run live scan across your repositories (capped at 2 repos for initial run)
-./tools/local_run.sh --user <your-github-username> --limit 2
+# Auto-detects GitHub auth and user login from `gh` CLI if available
+./tools/local_run.sh --user <your-github-username> --limit 3 --parallel 3
 ```
 
-This will:
-1. Enumerate your repositories via GitHub API.
-2. Shallow-clone each target into an isolated workspace.
-3. Execute real `cm find -y --bypass-warning .` on the codebase.
-4. Export real SARIF results via `cm report -f sarif > report.sarif`.
-5. Roll up findings into `fleet_report.md`, `fleet_report.json`, and update `state/cursor.json`.
+Key runner options:
+* `--limit <N>`: Maximum number of target repositories to process (default: `3`).
+* `-j, --parallel <N>`: Number of concurrent scan worker threads (default: `3`).
+* `--skip-unchanged`: Skip repositories whose current commit SHA matches `state/cursor.json`.
+* `--include <pattern>`: Target specific repositories (e.g. `--include "MNPI-*"`).
+
+Execution pipeline per target:
+1. Enumerates candidate repositories via GitHub API.
+2. Shallow-clones (`--depth 1`) each target into an isolated ephemeral workspace.
+3. Executes real `cm find -y --bypass-warning --unrestricted .` on the target codebase.
+4. Preserves full reasoning traces in `sarifs/<safe_repo_name>/scan.log`.
+5. Exports SARIF results via `cm report -f sarif > report.sarif` and injects `_fleet` metadata.
+6. Aggregates findings into `fleet_report.md` and `fleet_report.json`, advancing `state/cursor.json`.
 
 ---
 
@@ -90,50 +96,84 @@ This will:
 To prevent wasted spend and catch configuration bugs early, follow this progressive verification ladder:
 
 ### Rung 0: Rollup Offline against SARIF Fixtures ($0)
-Verify SARIF parsing, suppression filtering, CWE tallying, and cursor persistence using the provided test fixtures.
+Verify SARIF parsing, suppression filtering, CWE tallying, and cursor persistence using test fixtures:
 
 ```bash
 pytest -v
 ```
 
 ### Rung 1: Enumerate with Real PAT ($0)
-Verify read-only GitHub API enumeration, rate-limiting, and cursor skipping against your account without executing scans.
+Verify read-only GitHub API enumeration, rate-limiting, and cursor skipping without executing scans:
 
 ```bash
-export GITHUB_TOKEN="<your-pat>"
+# Test enumeration
 python3 fleet_enumerate.py --user <your-github-username> --limit 3
 
-# Test cursor skipping by confirming repos in cursor.json are skipped
+# Test cursor skipping (repos matching cursor.json are bypassed)
 python3 fleet_enumerate.py --user <your-github-username> --skip-unchanged --limit 3
 ```
 
 ### Rung 2: Live Local Scan on One Small Repo
-Run a real CodeMender scan on a single small repository to confirm findings and output generation:
+Run a real CodeMender scan on a single target to verify findings extraction and report generation:
 
 ```bash
-./tools/local_run.sh --user <your-github-username> --limit 1
+./tools/local_run.sh --user <your-github-username> --limit 1 --parallel 1
 ```
 
 ### Rung 3: CI via `workflow_dispatch` (Small Pilot)
 Trigger `.github/workflows/fleet_scan.yml` manually via GitHub Actions UI:
-- **`limit`**: `2`
-- **`max_parallel`**: `2`
+* **`limit`**: `2`
+* **`max_parallel`**: `2`
 
 Verify:
 1. `enumerate` job outputs matrix with 2 targets.
 2. `scan` matrix executes concurrently across 2 jobs.
-3. GCP Workload Identity Federation authenticates successfully.
-4. Real `cm find` and `cm report -f sarif` run with credentials scrubbed.
-5. `rollup` job downloads artifacts, generates report summary in `$GITHUB_STEP_SUMMARY`, and commits `state/cursor.json`.
+3. Google Cloud Workload Identity Federation authenticates successfully.
+4. Real `cm find` runs with credentials scrubbed from the environment.
+5. `rollup` job generates report summary in `$GITHUB_STEP_SUMMARY` and commits `state/cursor.json`.
 
 ### Rung 4: Fleet Production & Re-run Validation
 Widen the run parameters:
-- **`limit`**: `25`
-- **`max_parallel`**: `10`
+* **`limit`**: `25`
+* **`max_parallel`**: `10`
 
-Once finished, immediately trigger a second run with the same inputs:
-- Confirm that `enumerate` detects all 25 repos as unchanged (`skipped_unchanged=25`).
-- Confirm that the `scan` job is skipped cleanly (`count == 0`), preventing redundant LLM token spend.
+Trigger an immediate second run with identical inputs:
+* Confirm that `enumerate` detects all 25 repos as unchanged (`skipped_unchanged=25`).
+* Confirm that `scan` is skipped cleanly (`count == 0`), preventing redundant LLM token spend.
+
+---
+
+## Common Pitfalls & Troubleshooting
+
+### 1. `cm find: unknown shorthand flag: 'o' in -o`
+* **Cause**: `cm find` performs discovery and does not accept output format flags directly.
+* **Fix**: Run the two-stage sequence:
+  ```bash
+  cm find -y --bypass-warning --unrestricted .
+  cm report -f sarif > report.sarif
+  ```
+
+### 2. Zero findings on known vulnerable repositories
+* **Cause**: CodeMender's agent filesystem sandbox is restricted by `project_paths` in `~/.codemender/config.yaml`. When target code is cloned into `/private/var/folders/`, the agent is blocked from viewing target files.
+* **Fix**: Pass `--unrestricted` to `cm find` and ensure isolated worker configuration sets `project_paths` to the cloned directory.
+
+### 3. `No valid Application Default Credentials found`
+* **Cause**: Isolating `$HOME` for parallel workers hides the user's `~/.config/gcloud` credentials.
+* **Fix**: Symlink `~/.config` into the worker's isolated home or export `GOOGLE_APPLICATION_CREDENTIALS` pointing to your active ADC JSON file.
+
+### 4. Git history bloat during cloning
+* **Cause**: Standard `git clone` downloads entire commit logs dating back years.
+* **Fix**: Use shallow clones (`git clone --depth 1`). This provides 100% of the files at HEAD while discarding past history.
+
+---
+
+## Architecture Decision Records (ADRs)
+
+Key architectural decisions are documented in `docs/adr/`:
+* [ADR-0001: Parallelize Across Repositories, Never Subdirectories](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/docs/adr/0001-whole-codebase-parallelism.md)
+* [ADR-0002: Real CodeMender CLI Contract and Sandbox Boundary Management](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/docs/adr/0002-real-cm-contract-and-sandbox-isolation.md)
+
+Developer and AI coding assistant guidelines are maintained in [AGENTS.md](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/AGENTS.md).
 
 ---
 
