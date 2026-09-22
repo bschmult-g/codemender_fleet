@@ -180,8 +180,23 @@ def scan_single_target(target):
         os.makedirs(isolated_cm, exist_ok=True)
 
         real_cm = os.path.join(real_home, ".codemender")
+        iso_cfg = os.path.join(isolated_cm, "config.yaml")
         if os.path.exists(os.path.join(real_cm, "config.yaml")):
-            shutil.copy(os.path.join(real_cm, "config.yaml"), os.path.join(isolated_cm, "config.yaml"))
+            shutil.copy(os.path.join(real_cm, "config.yaml"), iso_cfg)
+            try:
+                import re
+                with open(iso_cfg, "r", encoding="utf-8") as f:
+                    cfg_text = f.read()
+                abs_clone = os.path.abspath(clone_dir)
+                if "project_paths:" in cfg_text:
+                    cfg_text = re.sub(r"project_paths:\s*\[.*?\]", f'project_paths: ["{abs_clone}"]', cfg_text)
+                    cfg_text = re.sub(r"project_paths:\s*\n(\s*-[^\n]*\n)*", f'project_paths:\n  - "{abs_clone}"\n', cfg_text)
+                else:
+                    cfg_text += f'\nproject_paths:\n  - "{abs_clone}"\n'
+                with open(iso_cfg, "w", encoding="utf-8") as f:
+                    f.write(cfg_text)
+            except Exception:
+                pass
         for k in os.listdir(real_cm):
             if k.startswith("identity.key"):
                 shutil.copy(os.path.join(real_cm, k), os.path.join(isolated_cm, k))
@@ -207,7 +222,7 @@ def scan_single_target(target):
         log_file = os.path.join(worker_temp, "scan.log")
         with open(log_file, "w", encoding="utf-8") as lf:
             find_res = subprocess.run(
-                [cm_bin, "find", "-y", "--bypass-warning", "."],
+                [cm_bin, "find", "-y", "--bypass-warning", "--unrestricted", "."],
                 cwd=clone_dir,
                 env=env,
                 stdout=lf,
@@ -225,6 +240,12 @@ def scan_single_target(target):
                 stderr=subprocess.DEVNULL
             )
 
+        # Ensure destination directory exists and always preserve scan log
+        dest_dir = os.path.join(sarifs_dir, safe_name)
+        os.makedirs(dest_dir, exist_ok=True)
+        if os.path.exists(log_file):
+            shutil.copy(log_file, os.path.join(dest_dir, "scan.log"))
+
         # Stamp _fleet into SARIF
         findings_count = 0
         if os.path.exists(report_sarif_path) and os.path.getsize(report_sarif_path) > 0:
@@ -240,8 +261,6 @@ def scan_single_target(target):
                     json.dump(sarif_data, f, indent=2)
                     f.write("\n")
 
-                dest_dir = os.path.join(sarifs_dir, safe_name)
-                os.makedirs(dest_dir, exist_ok=True)
                 shutil.copy(report_sarif_path, os.path.join(dest_dir, "report.sarif"))
             except Exception as exc:
                 print(f"  [!] [{repo}] ⚠️ SARIF parse error: {exc}", file=sys.stderr)

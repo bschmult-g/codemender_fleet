@@ -1,30 +1,53 @@
 name: CodeMender Fleet Scan
 
+# ==============================================================================
+# 1. TRIGGER & SCHEDULE CONFIGURATION
+# ==============================================================================
 on:
+  # SCHEDULED AUTOMATIC RUNS:
+  # - Standard 5-field cron expression in UTC time (min hour day-of-month month day-of-week).
+  # - Default: '0 3 * * *' = Runs daily at 03:00 UTC (11:00 PM EDT / 8:00 PM PDT).
+  # - To run weekly on Sundays: '0 3 * * 0'
+  # - To run every 12 hours:    '0 */12 * * *'
+  # - To disable automatic schedules: Comment out or delete the 'schedule:' block.
   schedule:
     - cron: '0 3 * * *'
+
+  # MANUAL DISPATCH (via the "Run workflow" button in GitHub Actions tab):
+  # Allows triggering immediate scans with on-the-fly custom overrides.
   workflow_dispatch:
     inputs:
       limit:
-        description: 'Maximum repos to scan (0 = unlimited up to 256)'
+        description: 'Maximum repos to scan (0 = unlimited up to GitHub 256 matrix cap)'
         required: false
-        default: '3'
+        default: '3' # TIP: Increase to '10', '50', or '0' for full production fleet scans
         type: string
       max_parallel:
-        description: 'Maximum parallel scan jobs'
+        description: 'Maximum parallel scan jobs running concurrently'
         required: false
-        default: '3'
+        default: '3' # TIP: Adjust based on your GitHub Actions runner concurrency and CodeMender quota
         type: string
 
+# ==============================================================================
+# 2. PERMISSIONS & CONCURRENCY
+# ==============================================================================
 permissions:
-  contents: write
-  id-token: write
+  contents: write  # Required to commit updated state/cursor.json back to the repository
+  id-token: write  # Required for Google Cloud Workload Identity Federation (OIDC)
 
 concurrency:
+  # Prevents overlapping fleet scans from writing conflicting cursors simultaneously
   group: fleet-scan
   cancel-in-progress: false
 
+# ==============================================================================
+# 3. JOBS PIPELINE
+# ==============================================================================
 jobs:
+  # ----------------------------------------------------------------------------
+  # JOB 1: ENUMERATE
+  # Queries the GitHub API to discover repositories and builds the matrix JSON.
+  # ----------------------------------------------------------------------------
   enumerate:
     name: Enumerate Repositories
     runs-on: ubuntu-latest
@@ -46,23 +69,49 @@ jobs:
       - name: Enumerate repositories
         id: enum
         env:
+          # CUSTOMIZATION: GITHUB AUTHENTICATION TOKEN
+          # - Default: GITHUB_TOKEN (sufficient if scanning repos in the same owner/org).
+          # - For scanning across private org repos: Set secret 'FLEET_READ_TOKEN'
+          #   with a Personal Access Token or GitHub App token (read-only 'Contents' & 'Metadata').
           GITHUB_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
+          # CUSTOMIZATION: TARGET REPOSITORIES & FILTERING
+          # - Scan a GitHub Organization: Replace --user with:
+          #     --org "your-organization-name"
+          # - Scan a specific User account:
+          #     --user "username" (or set repository variable GH_USER)
+          # - Filter by name patterns:
+          #     --include "service-*" --exclude "*-legacy"
+          # - Filter by GitHub topic:
+          #     --topic "production"
+          # - Filter out tiny/empty repos by minimum size:
+          #     --min-kb 50
+          # - Force re-scan of ALL repos (ignore cursor tracking):
+          #     Remove the '--skip-unchanged' flag below.
           python fleet_enumerate.py \
             --user "${{ vars.GH_USER || github.repository_owner }}" \
             --skip-unchanged \
             --limit "${{ inputs.limit || '3' }}"
 
+  # ----------------------------------------------------------------------------
+  # JOB 2: SCAN (MATRIX FAN-OUT)
+  # Clones each target repository read-only and runs CodeMender find concurrently.
+  # ----------------------------------------------------------------------------
   scan:
     name: Scan ${{ matrix.target.repo }}
     needs: enumerate
     if: needs.enumerate.outputs.count != '0'
+    # CUSTOMIZATION: JOB TIMEOUT
+    # Adjust based on average repo size. For large codebases (100k+ LoC), 45-60 min may be needed.
     timeout-minutes: 30
     runs-on: ubuntu-latest
     container:
+      # CUSTOMIZATION: CODEMENDER CONTAINER RUNNER IMAGE
+      # Set repository variable vars.CODEMENDER_RUNNER_IMAGE to use your private image
+      # (e.g. gcr.io/my-project/codemender-runner:latest).
       image: ${{ vars.CODEMENDER_RUNNER_IMAGE || 'ghcr.io/codemender/runner:latest' }}
     strategy:
-      fail-fast: false
+      fail-fast: false # Keep scanning other repos even if one target encounters an error
       max-parallel: ${{ fromJson(inputs.max_parallel || '3') }}
       matrix:
         target: ${{ fromJson(needs.enumerate.outputs.matrix) }}
@@ -76,6 +125,8 @@ jobs:
           TARGET_BRANCH: ${{ matrix.target.branch }}
           CLONE_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
+          # Shallow clone (--depth 1) downloads the full codebase snapshot at HEAD
+          # while skipping historical commits, maximizing clone speed and minimizing disk space.
           git clone --depth 1 --branch "$TARGET_BRANCH" \
             "https://x-access-token:${CLONE_TOKEN}@github.com/${TARGET_REPO}.git" target_repo
           cd target_repo
@@ -86,6 +137,11 @@ jobs:
         run: cp .codemender.yaml target_repo/.codemender.yaml
 
       - name: Authenticate to Google Cloud
+        # CUSTOMIZATION: GOOGLE CLOUD AUTHENTICATION (WIF)
+        # Uses Workload Identity Federation (keyless authentication) to connect to Vertex AI / CodeMender API.
+        # Required repository secrets:
+        #   GCP_WORKLOAD_IDENTITY_PROVIDER: projects/PROJECT_NUM/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
+        #   GCP_SERVICE_ACCOUNT: codemender-runner@PROJECT_ID.iam.gserviceaccount.com
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -97,13 +153,17 @@ jobs:
           # Scrub credentials from environment before invoking CodeMender
           unset GITHUB_TOKEN GH_TOKEN CLONE_TOKEN FLEET_READ_TOKEN
           
+          # CUSTOMIZATION: CODEMENDER SCAN OPTIONS & RETRIES
+          # - Model Selection: Add '--model gemini-3.8-flash-cyber' or '--model gemini-3.1-pro-preview'
+          # - Custom Context: Add '-c "Focus on auth flows, SSRF, and credential handling"'
+          # - '--unrestricted': Disables path constraints so the agent can read all cloned repository files.
           MAX_ATTEMPTS=3
           ATTEMPT=1
           SUCCESS=false
           
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
             echo "Running cm find (attempt $ATTEMPT of $MAX_ATTEMPTS)..."
-            if cm find -y --bypass-warning . && cm report -f sarif > report.sarif && [ -s report.sarif ]; then
+            if cm find -y --bypass-warning --unrestricted . && cm report -f sarif > report.sarif && [ -s report.sarif ]; then
               SUCCESS=true
               break
             fi
@@ -119,6 +179,7 @@ jobs:
 
       - name: Stamp fleet metadata into SARIF
         run: |
+          # Namespaces the SARIF with the target repo and commit SHA so rollup keeps findings isolated
           jq --arg repo "${{ matrix.target.repo }}" \
              --arg sha "${TARGET_SHA:-${{ matrix.target.sha }}}" \
              '._fleet = {repo: $repo, sha: $sha}' target_repo/report.sarif > stamped.sarif
@@ -130,6 +191,10 @@ jobs:
           path: stamped.sarif
           retention-days: 1
 
+  # ----------------------------------------------------------------------------
+  # JOB 3: ROLLUP & REPORTING
+  # Consolidates all per-repo SARIF artifacts into fleet reports and advances cursor.
+  # ----------------------------------------------------------------------------
   rollup:
     name: Rollup Fleet Reports
     needs: [enumerate, scan]
@@ -158,6 +223,8 @@ jobs:
           python fleet_rollup.py --in sarifs --cursor state/cursor.json
 
       - name: Upload fleet reports
+        # CUSTOMIZATION: AUDIT REPORT RETENTION
+        # Change retention-days to 90 or 365 if required by your compliance policies.
         uses: actions/upload-artifact@v4
         with:
           name: fleet-reports
@@ -165,6 +232,19 @@ jobs:
             fleet_report.json
             fleet_report.md
           retention-days: 30
+
+      # CUSTOMIZATION: ALERTING & NOTIFICATIONS (OPTIONAL)
+      # To send scan summaries to Slack, Microsoft Teams, or email, uncomment and configure below:
+      # - name: Send Slack Alert
+      #   if: always()
+      #   uses: slackapi/slack-github-action@v1.26.0
+      #   with:
+      #     payload: |
+      #       {
+      #         "text": "CodeMender Fleet Scan completed. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      #       }
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
       - name: Commit updated cursor
         run: |
