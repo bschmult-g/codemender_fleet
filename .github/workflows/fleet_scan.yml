@@ -103,8 +103,7 @@ jobs:
           
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
             echo "Running cm find (attempt $ATTEMPT of $MAX_ATTEMPTS)..."
-            if env -u GITHUB_TOKEN -u GH_TOKEN -u CLONE_TOKEN -u FLEET_READ_TOKEN \
-               cm find . --format sarif -o report.sarif && [ -s report.sarif ]; then
+            if cm find -y --bypass-warning . && cm report -f sarif > report.sarif && [ -s report.sarif ]; then
               SUCCESS=true
               break
             fi

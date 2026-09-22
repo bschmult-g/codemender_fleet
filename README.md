@@ -7,11 +7,11 @@ A lightweight, automated fleet scanner for scanning dozens or hundreds of GitHub
 ## ⚠️ Critical Scoping & Architectural Invariants
 
 - **Discovery Scan-Only (`cm find .`)**: This scanner executes discovery only. There is **NO** `cm verify`, **NO** `cm fix`, **NO** patch generation, **NO** pull requests, and **NO** branch manipulation.
+- **Real CodeMender Analysis (No Fake Fallbacks)**: Scans run using the actual CodeMender CLI (`cm find -y --bypass-warning .` followed by `cm report -f sarif > report.sarif`), generating genuine security findings directly against your code.
 - **Zero Execution of Target Code**: Target repositories are cloned strictly read-only. Nothing inside target repositories is ever built or executed. No sandboxing of untrusted builds is required or permitted.
 - **Zero Changes to Target Repos**: Target repositories require no workflows, no tokens, and no modifications. All work happens centrally in this scanner repo.
 - **Whole-Codebase Parallelism**: Parallelism is across **repositories** (N repositories scanned concurrently via GitHub Actions matrix jobs), **never** across directories within a single repository. `cm find` runs as a whole-codebase pass to prevent cross-file taint-flow blind spots and silent false negatives.
-- **Cost Control via Cursor Tracking**: `cm find` is backed by Gemini 2.5 Flash and bills per run. `state/cursor.json` tracks each repository's scanned HEAD commit SHA. When `--skip-unchanged` is active, repositories without new commits are skipped before running scans.
-- **CLI Contract Verification**: `cm find . --format sarif -o <output.sarif>` is an assumed CLI contract. **This contract must be explicitly verified against the actual CodeMender binary at Rung 3.**
+- **Cost Control via Cursor Tracking**: `cm find` is backed by Gemini 2.5 Flash / Gemini 3.8 Flash and bills per run. `state/cursor.json` tracks each repository's scanned HEAD commit SHA. When `--skip-unchanged` is active, repositories without new commits are skipped before running scans.
 
 ---
 
@@ -33,8 +33,8 @@ A lightweight, automated fleet scanner for scanning dozens or hundreds of GitHub
 │   ├── test_enumerate.py         # Unit tests for enumeration & filtering
 │   └── test_rollup.py            # Unit tests for rollup, suppressions, and cursor
 ├── tools/
-│   ├── fake_cm.sh                # Deterministic offline mock for CodeMender CLI
-│   └── local_run.sh              # Local zero-cost end-to-end runner
+│   ├── fake_cm.sh                # Deterministic offline mock for test fixtures
+│   └── local_run.sh              # Live local runner using real CodeMender
 └── README.md
 ```
 
@@ -42,7 +42,13 @@ A lightweight, automated fleet scanner for scanning dozens or hundreds of GitHub
 
 ## Prerequisites & Setup
 
-### GitHub Configuration
+### 1. CodeMender CLI
+The real CodeMender CLI (`cm`) must be installed on your system (e.g., at `/Users/bschmult/.gemini/jetski/bin/cm` or on your `PATH`). Verify by running:
+```bash
+cm --version
+```
+
+### 2. GitHub Configuration
 
 Configure the following in the scanner repository (**Settings > Secrets and variables > Actions**):
 
@@ -57,6 +63,28 @@ Configure the following in the scanner repository (**Settings > Secrets and vari
 
 ---
 
+## Running Scans
+
+### Live Local Scan across Your Repositories
+Run the real CodeMender scanner locally against your repositories:
+
+```bash
+# Set your GitHub PAT for repository cloning
+export GITHUB_TOKEN="<your-pat>"
+
+# Run live scan across your repositories (capped at 2 repos for initial run)
+./tools/local_run.sh --user <your-github-username> --limit 2
+```
+
+This will:
+1. Enumerate your repositories via GitHub API.
+2. Shallow-clone each target into an isolated workspace.
+3. Execute real `cm find -y --bypass-warning .` on the codebase.
+4. Export real SARIF results via `cm report -f sarif > report.sarif`.
+5. Roll up findings into `fleet_report.md`, `fleet_report.json`, and update `state/cursor.json`.
+
+---
+
 ## Staged Bring-Up Ladder
 
 To prevent wasted spend and catch configuration bugs early, follow this progressive verification ladder:
@@ -65,7 +93,6 @@ To prevent wasted spend and catch configuration bugs early, follow this progress
 Verify SARIF parsing, suppression filtering, CWE tallying, and cursor persistence using the provided test fixtures.
 
 ```bash
-# Run automated test suite
 pytest -v
 ```
 
@@ -73,46 +100,21 @@ pytest -v
 Verify read-only GitHub API enumeration, rate-limiting, and cursor skipping against your account without executing scans.
 
 ```bash
-# Test enumeration dry-run
 export GITHUB_TOKEN="<your-pat>"
 python3 fleet_enumerate.py --user <your-github-username> --limit 3
 
-# Test cursor skipping by adding a repo's HEAD SHA to state/cursor.json
+# Test cursor skipping by confirming repos in cursor.json are skipped
 python3 fleet_enumerate.py --user <your-github-username> --skip-unchanged --limit 3
 ```
 
-Confirm that repositories matching the recorded `last_sha` log:
-`Skipping <owner/repo>: unchanged at <sha>` and report `skipped_unchanged=N`.
-
-### Rung 2: Local End-to-End Pipeline with Fake CLI ($0)
-Execute the complete multi-repo clone, scan, and rollup pipeline locally using the deterministic `fake_cm.sh` stub.
+### Rung 2: Live Local Scan on One Small Repo
+Run a real CodeMender scan on a single small repository to confirm findings and output generation:
 
 ```bash
-./tools/local_run.sh --user <your-github-username> --limit 2
+./tools/local_run.sh --user <your-github-username> --limit 1
 ```
 
-Inspect the generated outputs:
-- `fleet_report.md` (Markdown summary table)
-- `fleet_report.json` (Structured metrics and per-repo breakdowns)
-- `state/cursor.json` (Updated commit SHAs)
-
-### Rung 3: Verify Real `cm find` Contract
-> **CRITICAL CHECK**: Verify the exact CLI flags, authentication mechanism, and SARIF output structure on a single small test repository before deploying fleet-wide CI.
-
-Inside your runner container or environment with `cm` installed:
-```bash
-git clone --depth 1 https://github.com/<your-account>/<small-test-repo>.git /tmp/test-repo
-cd /tmp/test-repo
-cp <path-to>/.codemender.yaml .
-
-# Confirm cm CLI flags match: cm find . --format sarif -o report.sarif
-cm find . --format sarif -o report.sarif
-
-# Verify report.sarif is valid SARIF JSON 2.1.0
-jq '.runs[0].results | length' report.sarif
-```
-
-### Rung 4: CI via `workflow_dispatch` (Small Pilot)
+### Rung 3: CI via `workflow_dispatch` (Small Pilot)
 Trigger `.github/workflows/fleet_scan.yml` manually via GitHub Actions UI:
 - **`limit`**: `2`
 - **`max_parallel`**: `2`
@@ -121,10 +123,10 @@ Verify:
 1. `enumerate` job outputs matrix with 2 targets.
 2. `scan` matrix executes concurrently across 2 jobs.
 3. GCP Workload Identity Federation authenticates successfully.
-4. `cm find` runs with credentials scrubbed (`unset GITHUB_TOKEN`, etc.).
+4. Real `cm find` and `cm report -f sarif` run with credentials scrubbed.
 5. `rollup` job downloads artifacts, generates report summary in `$GITHUB_STEP_SUMMARY`, and commits `state/cursor.json`.
 
-### Rung 5: Fleet Production & Re-run Validation
+### Rung 4: Fleet Production & Re-run Validation
 Widen the run parameters:
 - **`limit`**: `25`
 - **`max_parallel`**: `10`
@@ -163,7 +165,7 @@ options:
 
 ## Testing
 
-Run all unit and integration tests using pytest:
+Run unit and integration tests using pytest:
 
 ```bash
 pytest -v
