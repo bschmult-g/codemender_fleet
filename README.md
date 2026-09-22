@@ -173,8 +173,6 @@ Key architectural decisions are documented in `docs/adr/`:
 * [ADR-0001: Parallelize Across Repositories, Never Subdirectories](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/docs/adr/0001-whole-codebase-parallelism.md)
 * [ADR-0002: Real CodeMender CLI Contract and Sandbox Boundary Management](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/docs/adr/0002-real-cm-contract-and-sandbox-isolation.md)
 
-Developer and AI coding assistant guidelines are maintained in [AGENTS.md](file:///Users/bschmult/.gemini/jetski/scratch/codemender-fleet-scanner/AGENTS.md).
-
 ---
 
 ## CLI Reference
