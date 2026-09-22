@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# tools/local_run.sh - Drive the CodeMender fleet scanner pipeline locally with real CodeMender.
-# Runs enumerate, shallow clones each target, executes real 'cm find',
-# extracts SARIF via 'cm report -f sarif', stamps _fleet, collects SARIFs, and rolls up the final report.
+# tools/local_run.sh - Asynchronous, Parallel CodeMender Fleet Scanner Runner.
+# Fans out across discovered repositories in parallel using a concurrent worker pool.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +28,7 @@ fi
 USER_ARG=""
 ORG_ARG=""
 LIMIT_ARG="3"
+PARALLEL_ARG="3"
 SKIP_UNCHANGED=false
 EXTRA_ARGS=()
 
@@ -44,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --limit)
       LIMIT_ARG="$2"
+      shift 2
+      ;;
+    -j|--parallel|--max-parallel)
+      PARALLEL_ARG="$2"
       shift 2
       ;;
     --skip-unchanged)
@@ -100,9 +104,10 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
 fi
 
 echo "=========================================================="
-echo " CodeMender Fleet Scanner - Live Pipeline Runner"
+echo " CodeMender Fleet Scanner - Asynchronous Parallel Runner"
 echo "=========================================================="
-echo "Using real CodeMender at: $CM_BIN"
+echo "Using CodeMender binary: $CM_BIN"
+echo "Target Concurrency:      $PARALLEL_ARG parallel workers"
 
 echo ""
 echo "[Step 1/3] Enumerating repositories..."
@@ -121,92 +126,157 @@ SARIFS_DIR="$REPO_ROOT/sarifs"
 mkdir -p "$SARIFS_DIR"
 
 echo ""
-echo "[Step 2/3] Scanning repositories with real CodeMender (cm find)..."
-TEMP_BASE=$(mktemp -d)
-trap 'rm -rf "$TEMP_BASE"' EXIT
+echo "[Step 2/3] Fanning out scans asynchronously ($PARALLEL_ARG workers in parallel)..."
 
-# Read each target line from Python helper
-python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-for item in data:
-    print(f\"{item['repo']}\t{item['branch']}\t{item['sha']}\")
-" "$MATRIX_JSON" | while IFS=$'\t' read -r repo branch sha; do
-  echo "----------------------------------------------------------"
-  echo "Target: $repo (branch: $branch, sha: ${sha:0:7})"
+python3 - <<PYEOF
+import concurrent.futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 
-  safe_name=$(echo "$repo" | tr '/' '_')
-  clone_dir="$TEMP_BASE/$safe_name"
-  mkdir -p "$clone_dir"
+targets = json.loads('''$MATRIX_JSON''')
+repo_root = "$REPO_ROOT"
+sarifs_dir = "$SARIFS_DIR"
+real_home = "$REAL_HOME"
+cm_bin = "$CM_BIN"
+max_workers = int("$PARALLEL_ARG")
+token = os.environ.get("GITHUB_TOKEN") or os.environ.get("FLEET_READ_TOKEN") or ""
 
-  CLONE_URL="https://github.com/${repo}.git"
-  TOKEN="${GITHUB_TOKEN:-${FLEET_READ_TOKEN:-}}"
-  if [[ -n "$TOKEN" ]]; then
-    CLONE_URL="https://x-access-token:${TOKEN}@github.com/${repo}.git"
-  fi
+def scan_single_target(target):
+    repo = target["repo"]
+    branch = target["branch"]
+    sha = target["sha"]
+    safe_name = repo.replace("/", "_")
 
-  echo "Shallow cloning $repo..."
-  if ! git clone --depth 1 --branch "$branch" --quiet "$CLONE_URL" "$clone_dir" 2>/dev/null; then
-    echo "Warning: git clone failed for $repo; skipping" >&2
-    rm -rf "$clone_dir"
-    continue
-  fi
+    worker_temp = tempfile.mkdtemp(prefix=f"cm_{safe_name}_")
+    try:
+        clone_dir = os.path.join(worker_temp, "repo")
+        clone_url = f"https://github.com/{repo}.git"
+        if token:
+            clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
 
-  # Copy central .codemender.yaml into cloned tree
-  cp "$REPO_ROOT/.codemender.yaml" "$clone_dir/.codemender.yaml"
+        print(f"  [>] [{repo}] 📥 Shallow cloning branch '{branch}' (HEAD: {sha[:7]})...")
+        git_res = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", branch, "--quiet", clone_url, clone_dir],
+            capture_output=True,
+            text=True
+        )
+        if git_res.returncode != 0:
+            print(f"  [!] [{repo}] ❌ Git clone failed: {git_res.stderr.strip()}", file=sys.stderr)
+            return False, repo, 0
 
-  # Create an isolated state environment for this repository scan
-  isolated_home="$TEMP_BASE/cm_env_$safe_name"
-  mkdir -p "$isolated_home/.codemender"
-  if [[ -f "$REAL_HOME/.codemender/config.yaml" ]]; then
-    cp "$REAL_HOME/.codemender/config.yaml" "$isolated_home/.codemender/"
-  fi
-  if [[ -f "$REAL_HOME/.codemender/identity.key" ]]; then
-    cp "$REAL_HOME/.codemender/identity.key"* "$isolated_home/.codemender/" 2>/dev/null || true
-  fi
+        # Copy central .codemender.yaml into cloned repo
+        yaml_src = os.path.join(repo_root, ".codemender.yaml")
+        if os.path.exists(yaml_src):
+            shutil.copy(yaml_src, os.path.join(clone_dir, ".codemender.yaml"))
 
-  # Preserve Google Cloud credentials (ADC) and gcloud config
-  if [[ -d "$REAL_HOME/.config" ]]; then
-    ln -sf "$REAL_HOME/.config" "$isolated_home/.config"
-  fi
-  if [[ -f "$REAL_HOME/.config/gcloud/application_default_credentials.json" ]]; then
-    export GOOGLE_APPLICATION_CREDENTIALS="$REAL_HOME/.config/gcloud/application_default_credentials.json"
-  fi
+        # Setup isolated environment per repo
+        isolated_home = os.path.join(worker_temp, "home")
+        isolated_cm = os.path.join(isolated_home, ".codemender")
+        os.makedirs(isolated_cm, exist_ok=True)
 
-  echo "Running real CodeMender scan (cm find -y --bypass-warning .)..."
-  (
-    cd "$clone_dir"
-    export HOME="$isolated_home"
-    # Execute discovery scan
-    cm find -y --bypass-warning .
-    # Export scan results to SARIF
-    cm report -f sarif > report.sarif
-  )
+        real_cm = os.path.join(real_home, ".codemender")
+        if os.path.exists(os.path.join(real_cm, "config.yaml")):
+            shutil.copy(os.path.join(real_cm, "config.yaml"), os.path.join(isolated_cm, "config.yaml"))
+        for k in os.listdir(real_cm):
+            if k.startswith("identity.key"):
+                shutil.copy(os.path.join(real_cm, k), os.path.join(isolated_cm, k))
 
-  # Stamp _fleet into the SARIF
-  echo "Stamping _fleet metadata..."
-  python3 -c "
-import json, sys
-path, r, s = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(path, 'r', encoding='utf-8') as f:
-        sarif = json.load(f)
-    sarif['_fleet'] = {'repo': r, 'sha': s}
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(sarif, f, indent=2)
-        f.write('\n')
-except Exception as e:
-    sys.exit(f'Failed stamping SARIF: {e}')
-" "$clone_dir/report.sarif" "$repo" "$sha"
+        # Setup environment variables
+        env = os.environ.copy()
+        env["HOME"] = isolated_home
+        real_config = os.path.join(real_home, ".config")
+        if os.path.exists(real_config):
+            try:
+                os.symlink(real_config, os.path.join(isolated_home, ".config"))
+            except Exception:
+                pass
 
-  # Save to sarifs/<owner_name>/report.sarif
-  target_sarif_dir="$SARIFS_DIR/$safe_name"
-  mkdir -p "$target_sarif_dir"
-  cp "$clone_dir/report.sarif" "$target_sarif_dir/report.sarif"
-  echo "Saved real SARIF report to $target_sarif_dir/report.sarif"
+        adc_file = os.path.join(real_home, ".config", "gcloud", "application_default_credentials.json")
+        if os.path.exists(adc_file):
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = adc_file
 
-  rm -rf "$clone_dir" "$isolated_home"
-done
+        print(f"  [>] [{repo}] 🚀 Launching CodeMender scan (cm find)...")
+        start_time = time.time()
+
+        # Capture scan log
+        log_file = os.path.join(worker_temp, "scan.log")
+        with open(log_file, "w", encoding="utf-8") as lf:
+            find_res = subprocess.run(
+                [cm_bin, "find", "-y", "--bypass-warning", "."],
+                cwd=clone_dir,
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT
+            )
+
+        # Export SARIF findings
+        report_sarif_path = os.path.join(clone_dir, "report.sarif")
+        with open(report_sarif_path, "w", encoding="utf-8") as sf:
+            rep_res = subprocess.run(
+                [cm_bin, "report", "-f", "sarif"],
+                cwd=clone_dir,
+                env=env,
+                stdout=sf,
+                stderr=subprocess.DEVNULL
+            )
+
+        # Stamp _fleet into SARIF
+        findings_count = 0
+        if os.path.exists(report_sarif_path) and os.path.getsize(report_sarif_path) > 0:
+            try:
+                with open(report_sarif_path, "r", encoding="utf-8") as f:
+                    sarif_data = json.load(f)
+                sarif_data["_fleet"] = {"repo": repo, "sha": sha}
+
+                for run in sarif_data.get("runs", []):
+                    findings_count += len(run.get("results", []))
+
+                with open(report_sarif_path, "w", encoding="utf-8") as f:
+                    json.dump(sarif_data, f, indent=2)
+                    f.write("\n")
+
+                dest_dir = os.path.join(sarifs_dir, safe_name)
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy(report_sarif_path, os.path.join(dest_dir, "report.sarif"))
+            except Exception as exc:
+                print(f"  [!] [{repo}] ⚠️ SARIF parse error: {exc}", file=sys.stderr)
+
+        elapsed = int(time.time() - start_time)
+        print(f"  [*] [{repo}] ✅ Finished in {elapsed}s (Findings: {findings_count})")
+        return True, repo, findings_count
+
+    except Exception as exc:
+        print(f"  [!] [{repo}] ❌ Exception during scan: {exc}", file=sys.stderr)
+        return False, repo, 0
+    finally:
+        shutil.rmtree(worker_temp, ignore_errors=True)
+
+start_all = time.time()
+completed_count = 0
+total_findings = 0
+
+print(f"Fanning out across {len(targets)} repositories with {max_workers} concurrent workers...")
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    future_to_repo = {executor.submit(scan_single_target, target): target["repo"] for target in targets}
+    for future in concurrent.futures.as_completed(future_to_repo):
+        repo_name = future_to_repo[future]
+        try:
+            success, r, count = future.result()
+            if success:
+                completed_count += 1
+                total_findings += count
+        except Exception as exc:
+            print(f"  [!] Worker exception for {repo_name}: {exc}", file=sys.stderr)
+
+total_elapsed = int(time.time() - start_all)
+print(f"\nAll parallel scan jobs completed in {total_elapsed}s! (Scanned: {completed_count}/{len(targets)} repos)")
+PYEOF
 
 echo ""
 echo "[Step 3/3] Running rollup on collected SARIFs..."
@@ -214,7 +284,7 @@ echo "[Step 3/3] Running rollup on collected SARIFs..."
 
 echo ""
 echo "=========================================================="
-echo "Real CodeMender fleet run completed successfully!"
+echo "Parallel fleet scan completed successfully!"
 echo "Outputs generated:"
 echo " - Report (Markdown): $REPO_ROOT/fleet_report.md"
 echo " - Report (JSON):     $REPO_ROOT/fleet_report.json"
