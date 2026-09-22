@@ -12,6 +12,7 @@ import fnmatch
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from typing import Any
@@ -29,6 +30,38 @@ GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_EXCLUDES = [".github", "*-archive", "*-sandbox", "*-docs"]
 MAX_GITHUB_MATRIX_CAP = 256
+
+
+def get_token_from_gh_cli() -> str | None:
+    """Attempt to retrieve authentication token from 'gh' CLI if installed."""
+    try:
+        res = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_user_from_gh_cli() -> str | None:
+    """Attempt to retrieve current username from 'gh' CLI if authenticated."""
+    try:
+        res = subprocess.run(
+            ["gh", "api", "user", "-q", ".login"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -82,14 +115,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
-    # Validate target group (default to --user if env GH_USER is set)
+    # Validate target group (default to --user if env GH_USER is set or gh cli is logged in)
     if not args.user and not args.org:
         env_user = os.environ.get("GH_USER")
         if env_user:
             args.user = env_user
             logger.info("Defaulting target to user from GH_USER env var: %s", args.user)
         else:
-            parser.error("One of --user <login> or --org <name> is required.")
+            cli_user = get_user_from_gh_cli()
+            if cli_user:
+                args.user = cli_user
+                logger.info("Defaulting target to logged-in GitHub CLI user: %s", args.user)
+            else:
+                parser.error("One of --user <login> or --org <name> is required.")
 
     return args
 
@@ -117,6 +155,11 @@ def create_session() -> requests.Session:
     """Build requests session with GitHub API authentication and headers."""
     session = requests.Session()
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("FLEET_READ_TOKEN")
+    if not token:
+        token = get_token_from_gh_cli()
+        if token:
+            logger.info("Using authenticated token from 'gh' CLI.")
+
     session.headers.update(
         {
             "Accept": "application/vnd.github+json",
@@ -187,7 +230,6 @@ def fetch_all_repos(session: requests.Session, is_user: bool, target_name: str) 
             break
         repos.extend(page_data)
         params = None
-        # Follow Link header next relation
         next_link = resp.links.get("next")
         next_url = next_link.get("url") if next_link else None
 
@@ -272,7 +314,6 @@ def emit_output(target_items: list[dict[str, str]]) -> None:
             f.write(f"count={len(target_items)}\n")
         logger.info("Wrote matrix (%d targets) to $GITHUB_OUTPUT", len(target_items))
     else:
-        # Pretty-print to stdout for local consumption
         print(json.dumps(target_items, indent=2))
 
 

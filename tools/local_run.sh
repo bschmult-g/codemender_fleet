@@ -56,13 +56,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$USER_ARG" && -z "$ORG_ARG" ]]; then
-  if [[ -n "${GH_USER:-}" ]]; then
-    USER_ARG="$GH_USER"
-  else
-    echo "Error: Must specify --user <login> or --org <name> (or set GH_USER)." >&2
-    exit 1
+# Auto-detect GITHUB_TOKEN from gh CLI if not set
+if [[ -z "${GITHUB_TOKEN:-}" && -z "${FLEET_READ_TOKEN:-}" ]]; then
+  if command -v gh &>/dev/null; then
+    DETECTED_TOKEN="$(gh auth token 2>/dev/null || true)"
+    if [[ -n "$DETECTED_TOKEN" ]]; then
+      export GITHUB_TOKEN="$DETECTED_TOKEN"
+      echo "Auto-detected GitHub authentication from 'gh' CLI."
+    fi
   fi
+fi
+
+# Auto-detect user from gh if not set
+if [[ -z "$USER_ARG" && -z "$ORG_ARG" && -z "${GH_USER:-}" ]]; then
+  if command -v gh &>/dev/null; then
+    DETECTED_USER="$(gh api user -q .login 2>/dev/null || true)"
+    if [[ -n "$DETECTED_USER" ]]; then
+      USER_ARG="$DETECTED_USER"
+      echo "Auto-detected target GitHub account from 'gh': $USER_ARG"
+    fi
+  fi
+fi
+
+if [[ -z "$USER_ARG" && -z "$ORG_ARG" ]]; then
+  echo "Error: Must specify --user <login> or --org <name> (or set GH_USER)." >&2
+  exit 1
 fi
 
 ENUM_CMD=(python3 "$REPO_ROOT/fleet_enumerate.py" --limit "$LIMIT_ARG")
