@@ -1,0 +1,20 @@
+version: 1
+project_paths:
+  - "."
+exclude:
+  - "node_modules"
+  - "vendor"
+  - "third_party"
+  - "*.min.js"
+  - "testdata"
+scan:
+  cli_version: "preview"
+  scan_target: "."
+models:
+  find: "gemini-2.5-flash"
+behavior:
+  mode: "find_only"
+  fail_on_findings: false
+output:
+  formats:
+    - "sarif"

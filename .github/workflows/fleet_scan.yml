@@ -1,0 +1,180 @@
+name: CodeMender Fleet Scan
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Maximum repos to scan (0 = unlimited up to 256)'
+        required: false
+        default: '3'
+        type: string
+      max_parallel:
+        description: 'Maximum parallel scan jobs'
+        required: false
+        default: '3'
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: fleet-scan
+  cancel-in-progress: false
+
+jobs:
+  enumerate:
+    name: Enumerate Repositories
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.enum.outputs.matrix }}
+      count: ${{ steps.enum.outputs.count }}
+    steps:
+      - name: Checkout scanner repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Enumerate repositories
+        id: enum
+        env:
+          GITHUB_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          python fleet_enumerate.py \
+            --user "${{ vars.GH_USER || github.repository_owner }}" \
+            --skip-unchanged \
+            --limit "${{ inputs.limit || '3' }}"
+
+  scan:
+    name: Scan ${{ matrix.target.repo }}
+    needs: enumerate
+    if: needs.enumerate.outputs.count != '0'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CODEMENDER_RUNNER_IMAGE || 'ghcr.io/codemender/runner:latest' }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel || '3') }}
+      matrix:
+        target: ${{ fromJson(needs.enumerate.outputs.matrix) }}
+    steps:
+      - name: Checkout scanner repository
+        uses: actions/checkout@v4
+
+      - name: Clone target repository
+        env:
+          TARGET_REPO: ${{ matrix.target.repo }}
+          TARGET_BRANCH: ${{ matrix.target.branch }}
+          CLONE_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "$TARGET_BRANCH" \
+            "https://x-access-token:${CLONE_TOKEN}@github.com/${TARGET_REPO}.git" target_repo
+          cd target_repo
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "TARGET_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      - name: Copy CodeMender configuration
+        run: cp .codemender.yaml target_repo/.codemender.yaml
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Run CodeMender find (discovery only)
+        run: |
+          cd target_repo
+          # Scrub credentials from environment before invoking CodeMender
+          unset GITHUB_TOKEN GH_TOKEN CLONE_TOKEN FLEET_READ_TOKEN
+          
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          SUCCESS=false
+          
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            echo "Running cm find (attempt $ATTEMPT of $MAX_ATTEMPTS)..."
+            if env -u GITHUB_TOKEN -u GH_TOKEN -u CLONE_TOKEN -u FLEET_READ_TOKEN \
+               cm find . --format sarif -o report.sarif && [ -s report.sarif ]; then
+              SUCCESS=true
+              break
+            fi
+            echo "Attempt $ATTEMPT failed or report is empty. Retrying in 5 seconds..."
+            sleep 5
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Error: cm find failed after $MAX_ATTEMPTS attempts" >&2
+            exit 1
+          fi
+
+      - name: Stamp fleet metadata into SARIF
+        run: |
+          jq --arg repo "${{ matrix.target.repo }}" \
+             --arg sha "${TARGET_SHA:-${{ matrix.target.sha }}}" \
+             '._fleet = {repo: $repo, sha: $sha}' target_repo/report.sarif > stamped.sarif
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-${{ strategy.job-index }}
+          path: stamped.sarif
+          retention-days: 1
+
+  rollup:
+    name: Rollup Fleet Reports
+    needs: [enumerate, scan]
+    if: always() && needs.enumerate.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout scanner repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: sarifs
+          pattern: sarif-*
+          merge-multiple: true
+
+      - name: Aggregate SARIF findings
+        run: |
+          mkdir -p sarifs
+          python fleet_rollup.py --in sarifs --cursor state/cursor.json
+
+      - name: Upload fleet reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-reports
+          path: |
+            fleet_report.json
+            fleet_report.md
+          retention-days: 30
+
+      - name: Commit updated cursor
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/cursor.json
+          if git diff --staged --quiet; then
+            echo "Cursor state unchanged. Nothing to commit."
+          else
+            git commit -m "chore(fleet): advance scan cursor [skip ci]"
+            git push
+          fi

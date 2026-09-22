@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+sarifs/
+fleet_report.json
+fleet_report.md

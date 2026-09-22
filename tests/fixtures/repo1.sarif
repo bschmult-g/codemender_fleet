@@ -1,0 +1,125 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "_fleet": {
+    "repo": "acme/repo-with-findings",
+    "sha": "aaaabbbbccccddddeeeeffff0000111122223333"
+  },
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "CodeMender",
+          "semanticVersion": "1.0.0-preview",
+          "rules": [
+            {
+              "id": "SQLI",
+              "name": "SqlInjection",
+              "properties": {
+                "problem.severity": "high",
+                "tags": [
+                  "CWE-89"
+                ]
+              }
+            },
+            {
+              "id": "XSS",
+              "name": "CrossSiteScripting",
+              "properties": {
+                "problem.severity": "medium",
+                "tags": [
+                  "CWE-79"
+                ]
+              }
+            },
+            {
+              "id": "CMDI",
+              "name": "CommandInjection",
+              "properties": {
+                "problem.severity": "high",
+                "tags": [
+                  "CWE-78"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "SQLI",
+          "level": "error",
+          "message": {
+            "text": "Unescaped user input passed into database query"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/user_db.py"
+                },
+                "region": {
+                  "startLine": 25
+                }
+              }
+            }
+          ],
+          "properties": {
+            "problem.severity": "high"
+          }
+        },
+        {
+          "ruleId": "XSS",
+          "level": "warning",
+          "message": {
+            "text": "Unsanitized template render in handler"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/views.py"
+                },
+                "region": {
+                  "startLine": 88
+                }
+              }
+            }
+          ],
+          "properties": {
+            "problem.severity": "medium"
+          }
+        },
+        {
+          "ruleId": "CMDI",
+          "level": "error",
+          "message": {
+            "text": "Suppressed command execution vulnerability in test harness"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "tests/helper.py"
+                },
+                "region": {
+                  "startLine": 12
+                }
+              }
+            }
+          ],
+          "suppressions": [
+            {
+              "kind": "inSource",
+              "status": "accepted",
+              "justification": "False positive in test helper"
+            }
+          ],
+          "properties": {
+            "problem.severity": "high"
+          }
+        }
+      ]
+    }
+  ]
+}
