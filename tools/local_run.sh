@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REAL_HOME="${REAL_HOME:-$HOME}"
 
 # Ensure real CodeMender binary is on PATH (check standard location /Users/bschmult/.gemini/jetski/bin)
 if ! command -v cm &>/dev/null; then
@@ -157,11 +158,19 @@ for item in data:
   # Create an isolated state environment for this repository scan
   isolated_home="$TEMP_BASE/cm_env_$safe_name"
   mkdir -p "$isolated_home/.codemender"
-  if [[ -f "$HOME/.codemender/config.yaml" ]]; then
-    cp "$HOME/.codemender/config.yaml" "$isolated_home/.codemender/"
+  if [[ -f "$REAL_HOME/.codemender/config.yaml" ]]; then
+    cp "$REAL_HOME/.codemender/config.yaml" "$isolated_home/.codemender/"
   fi
-  if [[ -f "$HOME/.codemender/identity.key" ]]; then
-    cp "$HOME/.codemender/identity.key"* "$isolated_home/.codemender/" 2>/dev/null || true
+  if [[ -f "$REAL_HOME/.codemender/identity.key" ]]; then
+    cp "$REAL_HOME/.codemender/identity.key"* "$isolated_home/.codemender/" 2>/dev/null || true
+  fi
+
+  # Preserve Google Cloud credentials (ADC) and gcloud config
+  if [[ -d "$REAL_HOME/.config" ]]; then
+    ln -sf "$REAL_HOME/.config" "$isolated_home/.config"
+  fi
+  if [[ -f "$REAL_HOME/.config/gcloud/application_default_credentials.json" ]]; then
+    export GOOGLE_APPLICATION_CREDENTIALS="$REAL_HOME/.config/gcloud/application_default_credentials.json"
   fi
 
   echo "Running real CodeMender scan (cm find -y --bypass-warning .)..."
