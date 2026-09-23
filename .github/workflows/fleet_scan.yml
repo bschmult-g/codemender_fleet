@@ -4,17 +4,8 @@ name: CodeMender Fleet Scan
 # 1. TRIGGER & SCHEDULE CONFIGURATION
 # ==============================================================================
 on:
-  # SCHEDULED AUTOMATIC RUNS:
-  # - Standard 5-field cron expression in UTC time (min hour day-of-month month day-of-week).
-  # - Default: '0 3 * * *' = Runs daily at 03:00 UTC (11:00 PM EDT / 8:00 PM PDT).
-  # - To run weekly on Sundays: '0 3 * * 0'
-  # - To run every 12 hours:    '0 */12 * * *'
-  # - To disable automatic schedules: Comment out or delete the 'schedule:' block.
-  schedule:
-    - cron: '0 3 * * *'
-
-  # MANUAL DISPATCH (via the "Run workflow" button in GitHub Actions tab):
-  # Allows triggering immediate scans with on-the-fly custom overrides.
+  # MANUAL DISPATCH ONLY (via the "Run workflow" button in GitHub Actions tab):
+  # Automatic daily schedule has been removed. Scans only execute when manually triggered.
   workflow_dispatch:
     inputs:
       limit:
